@@ -1,4 +1,3 @@
-
 from pathlib import Path
 from typing import Any, Dict, List
 from composify import Service
@@ -9,18 +8,32 @@ from ruamel.yaml.comments import CommentedMap, CommentedSeq
 yaml_rt = YAML()
 yaml_rt.preserve_quotes = True
 yaml_rt.indent(mapping=2, sequence=2, offset=2)
+
 # ---------------------------
-# File I/O helpers (surgical updates)
+# File I/O helpers
 # ---------------------------
 
 def list_yaml_files(root: Path) -> List[Path]:
     return sorted(p for p in root.rglob("*.yml") if p.is_file())
 
 
-def upsert_service_in_file(compose_path: Path, svc: Service, overwrite: bool) -> None:
+def get_existing_service_names(compose_path: Path) -> List[str]:
+    """Return the list of service names in an existing compose file; raise if services: missing."""
+    if not compose_path.exists():
+        raise SystemExit(f"Compose file not found: {compose_path}")
+    data = yaml_rt.load(compose_path.read_text(encoding="utf-8")) or CommentedMap()
+    if not isinstance(data, (dict, CommentedMap)):
+        data = CommentedMap()
+    services = data.get("services")
+    if not isinstance(services, (dict, CommentedMap)):
+        raise SystemExit(f"{compose_path} has no top-level 'services:'")
+    return [str(k) for k in services.keys()]
+
+
+def upsert_service_in_file(compose_path: Path, svc: Service) -> None:
     """
-    Load compose_path, ensure top-level services: exists, and upsert the given service.
-    Only the targeted service key is updated; other services are preserved.
+    Load compose_path, ensure top-level services: exists, and insert/update the given service.
+    No overwrite question is asked; caller must ensure name is unique beforehand.
     """
     if not compose_path.exists():
         raise SystemExit(f"Compose file not found: {compose_path}")
@@ -30,15 +43,8 @@ def upsert_service_in_file(compose_path: Path, svc: Service, overwrite: bool) ->
         data = CommentedMap()
 
     services = data.get("services")
-    if services is None:
+    if services is None or not isinstance(services, (dict, CommentedMap)):
         raise SystemExit(f"{compose_path} has no top-level 'services:'")
-    if not isinstance(services, (dict, CommentedMap)):
-        raise SystemExit(f"Top-level 'services' is not a mapping in {compose_path}")
-
-    if svc.name in services and not overwrite:
-        raise SystemExit(
-            f"Service '{svc.name}' already exists in {compose_path}. Use overwrite to replace it."
-        )
 
     services[svc.name] = svc.to_compose_value()
 
@@ -92,6 +98,7 @@ def append_to_include_with_comment(main_compose: Path, rel_include_path: str, co
         yaml_rt.dump(data, f)
     return True
 
+
 # ---------------------------
 # Middleware chain discovery
 # ---------------------------
@@ -107,12 +114,12 @@ def list_middleware_chains(file: Path) -> List[str]:
     try:
         http = data.get("http") or {}
         mws = http.get("middlewares") or {}
-        # Keys under 'middlewares' are the chain names
         names = [str(k) for k in mws.keys()]
         names.sort()
         return names
     except Exception:
         return []
+
 
 # ---------------------------
 # Pretty-print helpers
