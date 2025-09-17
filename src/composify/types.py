@@ -13,14 +13,18 @@ yaml_rt.indent(mapping=2, sequence=2, offset=2)
 class Service(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
+    # Inputs (some are internal-only)
     name: str
     image: str
-    container_path: str
+    container_path: str             # internal-only; used to compute volumes
     profiles: List[str] = Field(default_factory=list)
-    expose: bool = False
-    service_port: int = 8084
-    container_name: Optional[str] = None
+    expose: bool = False            # internal-only; controls labels/networks vs ports
+    internal_port: int = 8084       # internal-only; used for labels/ports
+    external_port: Optional[int] = None  # internal-only; used only when expose=False
+    middleware_chain: Optional[str] = None  # internal-only; used in labels when expose=True
+    container_name: Optional[str] = None    # emitted
 
+    # Normalize profiles: split commas, strip, dedupe; always include "all"
     @field_validator("profiles", mode="before")
     @classmethod
     def _flatten_profiles(cls, v: Any) -> List[str]:
@@ -47,13 +51,13 @@ class Service(BaseModel):
                 out.append(p)
         return out
 
+    # Default container_name to name
     @field_validator("container_name", mode="after")
     @classmethod
     def _default_container_name(cls, v: Optional[str], info) -> str:
-        if v:
-            return v
-        return info.data.get("name")
+        return v or info.data.get("name")
 
+    # Computed compose fields (emitted in YAML)
     @computed_field  # type: ignore[misc]
     @property
     def volumes(self) -> List[str]:
@@ -62,6 +66,7 @@ class Service(BaseModel):
     @computed_field  # type: ignore[misc]
     @property
     def networks(self) -> Optional[List[str]]:
+        # Only when exposing via Traefik
         return ["t2_proxy"] if self.expose else None
 
     @computed_field  # type: ignore[misc]
@@ -70,14 +75,25 @@ class Service(BaseModel):
         if not self.expose:
             return None
         n = self.name
-        return {
+        labels: Dict[str, str] = {
             "traefik.enable": "true",
             f"traefik.http.routers.{n}-rtr.entrypoints": "web-secure",
             f"traefik.http.routers.{n}-rtr.rule": f"Host(`{n}.${{DOMAINNAME}}`)",
-            f"traefik.http.routers.{n}-rtr.middlewares": "chain-authelia@file",
             f"traefik.http.routers.{n}-rtr.service": f"{n}-svc",
-            f"traefik.http.services.{n}-svc.loadbalancer.server.port": str(self.service_port),
+            f"traefik.http.services.{n}-svc.loadbalancer.server.port": str(self.internal_port),
         }
+            labels[f"traefik.http.routers.{n}-rtr.middlewares"] = f"{self.middleware_chain}@file"
+        if self.middleware_chain:
+        return labels
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def ports(self) -> Optional[List[str]]:
+        # Only when NOT exposing via Traefik; map LAN:container
+        if self.expose:
+            return None
+        ext = self.external_port if self.external_port is not None else self.internal_port
+        return [f"{ext}:{self.internal_port}"]
 
     def primary_profile_title(self) -> str:
         for p in self.profiles:
@@ -86,27 +102,16 @@ class Service(BaseModel):
         return self.name[:1].upper() + self.name[1:]
 
     def to_compose_value(self) -> Dict[str, Any]:
+        # Exclude internal-only fields so they never appear in YAML
         return self.model_dump(
-            exclude={"name"},
+            exclude={
+                "name",
+                "container_path",
+                "expose",
+                "internal_port",
+                "external_port",
+                "middleware_chain",
+            },
             exclude_none=True,
             by_alias=True,
         )
-
-
-class ComposeStack(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    services: Dict[str, Service]
-
-    @classmethod
-    def new_with_service(cls, svc: Service) -> "ComposeStack":
-        return cls(services={svc.name: svc})
-
-    def add_or_replace(self, svc: Service, overwrite: bool) -> None:
-        if svc.name in self.services and not overwrite:
-            raise SystemExit(
-                f"Service '{svc.name}' already exists. Use overwrite to replace it."
-            )
-        self.services[svc.name] = svc
-
-    def to_compose_dict(self) -> Dict[str, Any]:
-        return {"services": {name: svc.to_compose_value() for name, svc in self.services.items()}}
