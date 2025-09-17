@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "composify"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "click>=8.2.1",
+    "pydantic>=2.11.9",
+    "ruamel-yaml>=0.18.15",
+]
+
+# expose your Click group as a console script
+[project.scripts]
+composify = "composify.cli.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
