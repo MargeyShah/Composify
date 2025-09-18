@@ -662,6 +662,8 @@ def create_db(
     else:
         click.secho("No additional services were modified.", fg="yellow")@cli.command()
 
+
+@cli.command()
 @click.argument("name")
 def create_secret(name: str):
     """
