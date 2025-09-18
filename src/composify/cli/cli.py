@@ -309,7 +309,7 @@ def new(
     if click.confirm("Would you like to create a Postgres DB service for this app now?", default=False):
         # Use <container_name>_db by default; avoid double _db
         base = name.strip()
-        db_service_name = base if base.endswith("_db") else f"{base}_db"
+        db_service_name = base if base.endswith("-db") else f"{base}-db"
 
         # Invoke the existing create_db command programmatically with sensible defaults.
         # Users will still be prompted inside create_db for DB creds and attachments.
@@ -398,7 +398,7 @@ def append(
     if click.confirm("Would you like to create a Postgres DB service for this app now?", default=False):
         # Use <container_name>_db by default; avoid double _db
         base = name.strip()
-        db_service_name = base if base.endswith("_db") else f"{base}_db"
+        db_service_name = base if base.endswith("-db") else f"{base}-db"
 
         # Invoke the existing create_db command programmatically with sensible defaults.
         # Users will still be prompted inside create_db for DB creds and attachments.
@@ -433,23 +433,21 @@ def append(
     "--db-name",
     "db_service_name",
     prompt=False,
-    callback=db_service_name_cb,
-    help="DB service/container name (defaults to <app>_db based on the compose path)",
+    callback=db_service_name_cb,  # existing callback (defaults to <app>_db based on compose path)
+    help="DB service/container name (defaults to <app>-db based on the compose path)",
 )
-# CHANGED: make --image optional (no default) so tag can drive the effective image
 @click.option(
     "--image",
     default=None,
     show_default=False,
     help="Full DB image ref (overrides --pg-tag). Example: docker.io/library/postgres:16-alpine",
 )
-# NEW: tag option to build the Postgres image when --image is not provided
 @click.option(
     "--pg-tag",
     "pg_tag",
-    default="16-alpine",
-    show_default=True,
-    help="Postgres image tag to use when --image is not provided",
+    default=None,
+    show_default=False,
+    help="Postgres image tag to use when --image is not provided (e.g., 16-alpine)",
 )
 @click.option(
     "--container-path",
@@ -460,13 +458,13 @@ def append(
 @click.option(
     "--network-name",
     default=None,
-    help="Override network name (default: DB service name if it ends with _db, else <db_name>_db)",
+    help="Override network name (default later based on the chosen prefix; avoids double -db)",
 )
 def create_db(
     compose_path: Path,
     db_service_name: str,
     image: Optional[str],
-    pg_tag: str,
+    pg_tag: Optional[str],
     container_path: str,
     network_name: Optional[str],
 ):
@@ -474,24 +472,57 @@ def create_db(
     Create a Postgres DB service, add a dedicated network in root compose, attach other services,
     and scaffold secrets (files + root secrets block).
     """
+    # Effective image: user-specified --image OR prompt for tag
     if not image:
-        pg_tag = click.prompt("Postgres image tag", default="17-alpine", show_default=True)
-    effective_image = image or f"docker.io/library/postgres:{pg_tag}"
-    # Effective image: user-specified --image OR build from tag
+        pg_tag = pg_tag or click.prompt("Postgres image tag", default="16-alpine", show_default=True)
     effective_image = image or f"docker.io/library/postgres:{pg_tag}"
 
-    # Resolve app name from compose path
-    app_name = derive_app_name_from_compose(compose_path, DEFAULT_STACKS_DIR)
+    # Let user choose additional services to attach BEFORE we derive prefix
+    try:
+        existing_services = [s for s in get_existing_service_names(compose_path) if s != db_service_name]
+    except SystemExit as e:
+        raise click.ClickException(str(e))
+
+    attach_selected: List[str] = []
+    if existing_services:
+        click.echo(f"\nSelect additional services from {compose_path} to attach to the DB network:")
+        for i, it in enumerate(existing_services, start=1):
+            click.echo(f"  {i}. {it}")
+        raw = click.prompt("Enter numbers (comma-separated), or 0 to skip", default="0").strip()
+        if raw and raw != "0":
+            try:
+                idxs = [int(x) for x in raw.split(",") if x.strip()]
+                seen = set()
+                for i in idxs:
+                    if 1 <= i <= len(existing_services):
+                        name = existing_services[i - 1]
+                        if name not in seen:
+                            attach_selected.append(name)
+                            seen.add(name)
+            except ValueError:
+                click.secho("Invalid input; skipping additional attachments.", fg="yellow")
+
+    # Choose an app prefix for names (network/service/secrets)
+    # Default to the single selected service if exactly one chosen, else derive from compose path
+    suggested_prefix = attach_selected[0] if len(attach_selected) == 1 else derive_app_name_from_compose(compose_path, DEFAULT_STACKS_DIR)
+    prefix = click.prompt("App prefix for DB (used for network/service/secrets)", default=suggested_prefix, show_default=True).strip()
+    app_name = prefix
     pretty_app = app_name.replace("-", " ").replace("_", " ").title()
 
-    # Resolve network name (avoid double -db)
+    # Optionally align the DB service/container name with the chosen prefix
+    desired_db_service = app_name if app_name.endswith("-db") else f"{app_name}-db"
+    if db_service_name != desired_db_service:
+        if click.confirm(f"Rename DB service to '{desired_db_service}' to match the prefix?", default=True):
+            db_service_name = desired_db_service
+
+    # Resolve network name (avoid double _db); prefer user override if provided
     if network_name:
         net_name = network_name.strip()
     else:
         base = db_service_name.strip()
         net_name = base if base.endswith("-db") else f"{base}-db"
 
-    # Decide whether we can update stacks/db-viewer.yml
+    # Determine if we can update stacks/db-viewer.yml
     db_viewer_can_update = False
     if DB_VIEWER_COMPOSE.exists():
         try:
@@ -510,7 +541,7 @@ def create_db(
     # 2) Prompt for DB creds with sensible defaults (no confirmation for password)
     default_user = app_name
     default_db = app_name
-    gen_pw = pysecrets.token_urlsafe(40)
+    gen_pw = pysecrets.token_urlsafe(24)
 
     click.echo("\nDatabase credentials (press Enter to accept defaults):")
     db_user = click.prompt("Database user", default=default_user)
@@ -523,7 +554,7 @@ def create_db(
     )
     db_database = click.prompt("Database name", default=default_db)
 
-    # 3) Prepare Postgres secrets names and file contents
+    # 3) Prepare Postgres secrets names and file contents using the chosen prefix
     img_lower = effective_image.lower()
     if "postgres" not in img_lower:
         click.secho("Warning: secrets scaffolding currently targets Postgres images. Proceeding anyway.", fg="yellow")
@@ -531,7 +562,7 @@ def create_db(
     secret_user = f"{app_name}_postgresql_user"
     secret_password = f"{app_name}_postgresql_password"
     secret_db = f"{app_name}_postgresql_db"
-    secret_names = [secret_db, secret_user, secret_password]  # alphabetic insertion handled by util
+    secret_names = [secret_db, secret_user, secret_password]  # alphabetical insertion handled by util
 
     secret_contents: Dict[str, str] = {
         secret_user: db_user,
@@ -565,7 +596,7 @@ def create_db(
 
     svc = Service(
         name=db_service_name,
-        image=effective_image,  # use the computed image
+        image=effective_image,
         container_path=container_path,
         profiles=[],  # 'all' added by validator
         restart="unless-stopped",
@@ -580,35 +611,10 @@ def create_db(
     click.echo(f"\nThis DB service will be appended to {compose_path}:")
     click.secho(dump_yaml_str(svc_snippet), fg="green")
 
-    # 5) Select additional services in the chosen compose to attach to this DB network
-    try:
-        existing_services = [s for s in get_existing_service_names(compose_path) if s != db_service_name]
-    except SystemExit as e:
-        raise click.ClickException(str(e))
-
-    attach_selected: List[str] = []
-    if existing_services:
-        click.echo(f"\nSelect additional services from {compose_path} to attach to '{net_name}':")
-        for i, it in enumerate(existing_services, start=1):
-            click.echo(f"  {i}. {it}")
-        raw = click.prompt("Enter numbers (comma-separated), or 0 to skip", default="0").strip()
-        if raw and raw != "0":
-            try:
-                idxs = [int(x) for x in raw.split(",") if x.strip()]
-                seen = set()
-                for i in idxs:
-                    if 1 <= i <= len(existing_services):
-                        name = existing_services[i - 1]
-                        if name not in seen:
-                            attach_selected.append(name)
-                            seen.add(name)
-            except ValueError:
-                click.secho("Invalid input; skipping additional attachments.", fg="yellow")
-
-    # 6) About to...
+    # 5) Confirm
     click.echo("\nAbout to:")
     click.echo(f"- Add network '{net_name}' with subnet {chosen_subnet} to {MAIN_COMPOSE}")
-    click.echo(f"- Create secret files in {SECRETSDIR_PATH}: {', '.join([secret_user, secret_password, secret_db])}")
+    click.echo(f"- Create secret files in {SECRETSDIR_PATH}: {', '.join(secret_names)}")
     click.echo(f"- Add secrets entries to {MAIN_COMPOSE} (alphabetical) with comment '# {pretty_app} Secrets'")
     click.echo(f"- Append DB service '{db_service_name}' to {compose_path}")
     if attach_selected:
@@ -624,7 +630,7 @@ def create_db(
         click.secho("No changes made.", fg="yellow")
         return
 
-    # 7) Apply changes
+    # 6) Apply changes
     try:
         # Root network
         upsert_network_in_main_compose(MAIN_COMPOSE, net_name, chosen_subnet, internal=True)
@@ -647,17 +653,15 @@ def create_db(
     except SystemExit as e:
         raise click.ClickException(str(e))
 
-    # 8) Done
+    # 7) Done
     click.secho(f"\nNetwork '{net_name}' added (or verified) in {MAIN_COMPOSE}", fg="green")
-    click.secho(f"Secrets created under {SECRETSDIR_PATH}", fg="green")
-    click.secho("Secrets entries added to root compose", fg="green")
+    click.secho("Secrets files created and entries added to root compose", fg="green")
     click.secho(f"DB service '{db_service_name}' written to {compose_path}", fg="green")
     if attach_selected:
-        click.secho(f"Attached '{net_name}' to: {', '.join(attach_selected)} in {compose_path}", fg="green")
+        click.secho(f"Attached '{net_name}' to: {', '.join(attach_selected)}", fg="green")
     else:
-        click.secho("No additional services were modified.", fg="yellow")
+        click.secho("No additional services were modified.", fg="yellow")@cli.command()
 
-@cli.command()
 @click.argument("name")
 def create_secret(name: str):
     """
@@ -666,7 +670,7 @@ def create_secret(name: str):
     """
     def _pretty_name(name: str) -> str:
         return name.replace("-", " ").replace("_", " ").title()
-    secret_name = name.strip()
+    secret_name = name.strip().replace('-', '_')
     if not secret_name or any(ch in secret_name for ch in ("/", "\\")):
         raise click.ClickException("Secret name must be a simple file name (no path separators).")
 
