@@ -1,13 +1,5 @@
 # from typing import Any, Dict, List, Optional
-# from pathlib import Path
-# from pydantic import BaseModel, Field, ConfigDict, field_validator, computed_field
-# from ruamel.yaml import YAML
-# from ruamel.yaml.comments import CommentedMap, CommentedSeq
-#
-# # Shared YAML instance (round-trip capable for comment handling)
-# yaml_rt = YAML()
-# yaml_rt.preserve_quotes = True
-# yaml_rt.indent(mapping=2, sequence=2, offset=2)
+# from pydantic import BaseModel, Field, field_validator, computed_field, ConfigDict
 #
 # class Service(BaseModel):
 #     model_config = ConfigDict(extra="ignore")
@@ -17,12 +9,15 @@
 #     image: str
 #     container_path: str              # internal-only; used to compute volumes
 #     profiles: List[str] = Field(default_factory=list)
-#     restart: Optional[str] = 'unless-stopped'
+#     restart: Optional[str] = "unless-stopped"
 #     expose: bool = False             # internal-only; controls labels/networks vs ports
 #     internal_port: int               # REQUIRED; used for labels/ports; not emitted
 #     external_port: Optional[int] = None  # internal-only; only when expose=False; not emitted
 #     middleware_chain: Optional[str] = None  # internal-only; only when expose=True; not emitted
 #     container_name: Optional[str] = None    # emitted
+#     environment: Dict[str, str] = Field(
+#         default_factory=lambda: {"PUID": "$PUID", "PGID": "$PGID", "TZ": "$TZ"}
+#     )
 #
 #     # Normalize profiles: split commas, strip, dedupe; always include "all"
 #     @field_validator("profiles", mode="before")
@@ -102,42 +97,57 @@
 #         return self.name[:1].upper() + self.name[1:]
 #
 #     def to_compose_value(self) -> Dict[str, Any]:
-#         # Exclude internal-only fields so they never appear in YAML
-#         return self.model_dump(
-#             exclude={
-#                 "name",
-#                 "container_path",
-#                 "expose",
-#                 "internal_port",
-#                 "external_port",
-#                 "middleware_chain",
-#             },
-#             exclude_none=True,
-#             by_alias=True,
-#         )
-
+#         # Build a normal dict in desired order (insertion order preserved in Python 3.7+)
+#         out: Dict[str, Any] = {}
+#         out["image"] = self.image
+#         out["container_name"] = self.container_name or self.name
+#         if self.restart is not None:
+#             out["restart"] = self.restart  # e.g., "unless-stopped"
+#         if self.profiles:
+#             out["profiles"] = self.profiles
+#         if self.expose:
+#             nets = self.networks
+#             if nets:
+#                 out["networks"] = nets
+#         out["volumes"] = self.volumes
+#         if self.environment:
+#             out["environment"] = self.environment
+#         if self.expose:
+#             lbls = self.labels
+#             if lbls:
+#                 out["labels"] = lbls
+#         else:
+#             prts = self.ports
+#             if prts:
+#                 out["ports"] = prts
+#         return out
+#
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, field_validator, computed_field, ConfigDict
 
 class Service(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    # Inputs (some are internal-only)
     name: str
     image: str
-    container_path: str              # internal-only; used to compute volumes
+    container_path: str
     profiles: List[str] = Field(default_factory=list)
     restart: Optional[str] = "unless-stopped"
-    expose: bool = False             # internal-only; controls labels/networks vs ports
-    internal_port: int               # REQUIRED; used for labels/ports; not emitted
-    external_port: Optional[int] = None  # internal-only; only when expose=False; not emitted
-    middleware_chain: Optional[str] = None  # internal-only; only when expose=True; not emitted
-    container_name: Optional[str] = None    # emitted
+    expose: bool = False
+    internal_port: int
+    external_port: Optional[int] = None
+    middleware_chain: Optional[str] = None
+    container_name: Optional[str] = None
     environment: Dict[str, str] = Field(
         default_factory=lambda: {"PUID": "$PUID", "PGID": "$PGID", "TZ": "$TZ"}
     )
 
-    # Normalize profiles: split commas, strip, dedupe; always include "all"
+    # already added before (from previous step)
+    networks_extra: List[str] = Field(default_factory=list)
+
+    # NEW: allow services to reference secrets
+    secrets: List[str] = Field(default_factory=list)
+
     @field_validator("profiles", mode="before")
     @classmethod
     def _flatten_profiles(cls, v: Any) -> List[str]:
@@ -164,23 +174,15 @@ class Service(BaseModel):
                 out.append(p)
         return out
 
-    # Default container_name to name
     @field_validator("container_name", mode="after")
     @classmethod
     def _default_container_name(cls, v: Optional[str], info) -> str:
         return v or info.data.get("name")
 
-    # Computed compose fields (emitted in YAML)
     @computed_field  # type: ignore[misc]
     @property
     def volumes(self) -> List[str]:
         return [f"${{DOCKERDIR}}/{self.name}:{self.container_path}"]
-
-    @computed_field  # type: ignore[misc]
-    @property
-    def networks(self) -> Optional[List[str]]:
-        # Only when exposing via Traefik
-        return ["t2_proxy"] if self.expose else None
 
     @computed_field  # type: ignore[misc]
     @property
@@ -202,7 +204,6 @@ class Service(BaseModel):
     @computed_field  # type: ignore[misc]
     @property
     def ports(self) -> Optional[List[str]]:
-        # Only when NOT exposing via Traefik; map LAN:container
         if self.expose:
             return None
         ext = self.external_port if self.external_port is not None else self.internal_port
@@ -215,21 +216,29 @@ class Service(BaseModel):
         return self.name[:1].upper() + self.name[1:]
 
     def to_compose_value(self) -> Dict[str, Any]:
-        # Build a normal dict in desired order (insertion order preserved in Python 3.7+)
         out: Dict[str, Any] = {}
         out["image"] = self.image
         out["container_name"] = self.container_name or self.name
         if self.restart is not None:
-            out["restart"] = self.restart  # e.g., "unless-stopped"
+            out["restart"] = self.restart
         if self.profiles:
             out["profiles"] = self.profiles
+
+        nets: List[str] = []
         if self.expose:
-            nets = self.networks
-            if nets:
-                out["networks"] = nets
+            nets.append("t2_proxy")
+        if self.networks_extra:
+            nets.extend(self.networks_extra)
+        if nets:
+            out["networks"] = nets
+
         out["volumes"] = self.volumes
         if self.environment:
             out["environment"] = self.environment
+
+        if self.secrets:
+            out["secrets"] = self.secrets
+
         if self.expose:
             lbls = self.labels
             if lbls:

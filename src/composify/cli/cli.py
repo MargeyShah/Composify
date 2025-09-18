@@ -1,4 +1,6 @@
 import click
+import secrets as pysecrets
+import os
 from pathlib import Path
 from typing import List, Optional
 
@@ -13,15 +15,24 @@ from composify import (
     write_new_stack_file,
     list_middleware_chains,
     get_existing_service_names,
+    list_root_network_subnets,
+    pick_unused_subnet,
+    upsert_network_in_main_compose,
+    attach_network_to_services,
+    derive_app_name_from_compose,
+    upsert_root_secrets,
+    ensure_secret_files,
 )
-
-DEFAULT_ROOT = Path("/home/margey/docker")
+home_dir = os.getenv('HOME')
+DEFAULT_ROOT = Path(f"{home_dir}/docker")
+SECRETSDIR_PATH = DEFAULT_ROOT / "secrets"  # ~/docker/secrets
 DEFAULT_STACKS_DIR = DEFAULT_ROOT / "stacks"
 MAIN_COMPOSE = DEFAULT_ROOT / "docker-compose.yml"
-MIDDLEWARE_CHAINS_FILE = Path("/home/margey/docker/apps/traefik2/rules/middleware-chains.yml")
+MIDDLEWARE_CHAINS_FILE = Path(f"{home_dir}/docker/apps/traefik2/rules/middleware-chains.yml")
 
 RESTART_CHOICES = ["always", "unless-stopped", "on-failure", "no"]
-
+DB_VIEWER_COMPOSE = DEFAULT_STACKS_DIR / "db-viewer.yml"
+DB_VIEWER_SERVICE = "pga"
 
 class CommaList(click.ParamType):
     name = "comma-list"
@@ -164,6 +175,32 @@ def folder_available_cb(ctx: click.Context, param: click.Option, value: Optional
             continue
         return v
 
+def db_service_name_cb(ctx: click.Context, param: click.Option, value: Optional[str]) -> str:
+    # Compute <app_name> from the compose path
+    compose_path: Path | None = ctx.params.get("compose_path")
+    if not compose_path:
+        # choose_compose_cb guarantees compose_path will be set before this callback runs,
+        # but guard anyway
+        compose_path = choose_compose_cb(ctx, param, None)
+
+    app_name = derive_app_name_from_compose(compose_path, DEFAULT_STACKS_DIR)
+    default_name = f"{app_name}-db"
+
+    # Prompt with default
+    name = (value or "").strip()
+    if not name:
+        name = click.prompt("DB service/container name", default=default_name, show_default=True).strip()
+
+    # Uniqueness check (same logic as unique_name_cb)
+    try:
+        existing = set(get_existing_service_names(compose_path))
+    except SystemExit as e:
+        raise click.ClickException(str(e))
+    if name in existing:
+        raise click.BadParameter(
+            click.style(f"A service named '{name}' already exists in {compose_path}.", fg='red')
+        )
+    return name
 
 @click.group()
 def cli():
@@ -186,9 +223,9 @@ def cli():
 @click.option("--expose/--no-expose", default=False, prompt="Expose via Traefik (adds networks: t2_proxy and labels)?", help="Expose through Traefik")
 @click.option("--internal-port", type=int, prompt="Container internal port", help="Container internal port")
 @click.option("--external-port", type=int, default=None, callback=external_port_cb, help="LAN port (when not exposing)")
+@click.option("--middleware-chain", default=None, callback=middleware_chain_cb, help="Traefik middleware chain")
 @click.option("--profiles", type=CommaList(), default="", prompt="Profiles (comma-separated, optional)", show_default=False, help="Compose profiles")
 @click.option("--restart", default=None, callback=restart_select_cb, help="Container restart policy")
-@click.option("--middleware-chain", default=None, callback=middleware_chain_cb, help="Traefik middleware chain")
 def new(
     folder: str,
     name: str,
@@ -197,9 +234,9 @@ def new(
     expose: bool,
     internal_port: int,
     external_port: Optional[int],
+    middleware_chain: Optional[str],
     profiles: List[str],
     restart: Optional[str],
-    middleware_chain: Optional[str],
 ):
     """Create a new stack and include it in main compose."""
     stack_dir = DEFAULT_STACKS_DIR / folder
@@ -268,6 +305,31 @@ def new(
     else:
         click.secho("Include entry already present; no changes to include list.", fg="yellow")
 
+    # offer to create a DB service for this app now
+    if click.confirm("Would you like to create a Postgres DB service for this app now?", default=False):
+        # Use <container_name>_db by default; avoid double _db
+        base = name.strip()
+        db_service_name = base if base.endswith("_db") else f"{base}_db"
+
+        # Invoke the existing create_db command programmatically with sensible defaults.
+        # Users will still be prompted inside create_db for DB creds and attachments.
+        ctx = click.get_current_context()
+        try:
+            ctx.invoke(
+                create_db,  # make sure create_db is defined in the same module or imported above
+                compose_path=stack_compose,
+                db_service_name=db_service_name,
+                image="docker.io/library/postgres:16-alpine",
+                container_path="/var/lib/postgresql/data",
+                network_name=None,
+            )
+        except click.ClickException as e:
+            # surface any handled errors nicely
+            raise
+        except Exception as e:
+            # convert unexpected errors
+            raise click.ClickException(str(e))
+
 
 # APPEND command
 @cli.command()
@@ -287,9 +349,9 @@ def new(
 @click.option("--expose/--no-expose", default=False, prompt="Expose via Traefik (adds networks: t2_proxy and labels)?", help="Expose through Traefik")
 @click.option("--internal-port", type=int, prompt="Container internal port", help="Container internal port")
 @click.option("--external-port", type=int, default=None, callback=external_port_cb, help="LAN port (when not exposing)")
+@click.option("--middleware-chain", default=None, callback=middleware_chain_cb, help="Traefik middleware chain")
 @click.option("--profiles", type=CommaList(), default="", prompt="Profiles (comma-separated, optional)", show_default=False, help="Compose profiles")
 @click.option("--restart", default=None, callback=restart_select_cb, help="Container restart policy")
-@click.option("--middleware-chain", default=None, callback=middleware_chain_cb, help="Traefik middleware chain")
 def append(
     compose_path: Path,
     name: str,
@@ -298,9 +360,9 @@ def append(
     expose: bool,
     internal_port: int,
     external_port: Optional[int],
+    middleware_chain: Optional[str],
     profiles: List[str],
     restart: Optional[str],
-    middleware_chain: Optional[str],
 ):
     """Append a service to an existing compose file."""
     svc = Service(
@@ -332,6 +394,300 @@ def append(
 
     click.secho(f"Service '{svc.name}' written to {compose_path}", fg="green")
 
+    # offer to create a DB service for this app now
+    if click.confirm("Would you like to create a Postgres DB service for this app now?", default=False):
+        # Use <container_name>_db by default; avoid double _db
+        base = name.strip()
+        db_service_name = base if base.endswith("_db") else f"{base}_db"
+
+        # Invoke the existing create_db command programmatically with sensible defaults.
+        # Users will still be prompted inside create_db for DB creds and attachments.
+        ctx = click.get_current_context()
+        try:
+            ctx.invoke(
+                create_db,  # make sure create_db is defined in the same module or imported above
+                compose_path=compose_path,
+                db_service_name=db_service_name,
+                image="docker.io/library/postgres:16-alpine",
+                container_path="/var/lib/postgresql/data",
+                network_name=None,
+            )
+        except click.ClickException as e:
+            # surface any handled errors nicely
+            raise
+        except Exception as e:
+            # convert unexpected errors
+            raise click.ClickException(str(e))
+
+
+@cli.command()
+@click.option(
+    "--compose",
+    "compose_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    callback=choose_compose_cb,
+    help=f"Compose YAML file (under {DEFAULT_STACKS_DIR}). If omitted, you'll choose from a list.",
+)
+@click.option(
+    "--db-name",
+    "db_service_name",
+    prompt=False,
+    callback=db_service_name_cb,
+    help="DB service/container name (defaults to <app>_db based on the compose path)",
+)
+# CHANGED: make --image optional (no default) so tag can drive the effective image
+@click.option(
+    "--image",
+    default=None,
+    show_default=False,
+    help="Full DB image ref (overrides --pg-tag). Example: docker.io/library/postgres:16-alpine",
+)
+# NEW: tag option to build the Postgres image when --image is not provided
+@click.option(
+    "--pg-tag",
+    "pg_tag",
+    default="16-alpine",
+    show_default=True,
+    help="Postgres image tag to use when --image is not provided",
+)
+@click.option(
+    "--container-path",
+    default="/var/lib/postgresql/data",
+    show_default=True,
+    help="Internal data path to mount (e.g., /var/lib/postgresql/data)",
+)
+@click.option(
+    "--network-name",
+    default=None,
+    help="Override network name (default: DB service name if it ends with _db, else <db_name>_db)",
+)
+def create_db(
+    compose_path: Path,
+    db_service_name: str,
+    image: Optional[str],
+    pg_tag: str,
+    container_path: str,
+    network_name: Optional[str],
+):
+    """
+    Create a Postgres DB service, add a dedicated network in root compose, attach other services,
+    and scaffold secrets (files + root secrets block).
+    """
+    if not image:
+        pg_tag = click.prompt("Postgres image tag", default="17-alpine", show_default=True)
+    effective_image = image or f"docker.io/library/postgres:{pg_tag}"
+    # Effective image: user-specified --image OR build from tag
+    effective_image = image or f"docker.io/library/postgres:{pg_tag}"
+
+    # Resolve app name from compose path
+    app_name = derive_app_name_from_compose(compose_path, DEFAULT_STACKS_DIR)
+    pretty_app = app_name.replace("-", " ").replace("_", " ").title()
+
+    # Resolve network name (avoid double -db)
+    if network_name:
+        net_name = network_name.strip()
+    else:
+        base = db_service_name.strip()
+        net_name = base if base.endswith("-db") else f"{base}-db"
+
+    # Decide whether we can update stacks/db-viewer.yml
+    db_viewer_can_update = False
+    if DB_VIEWER_COMPOSE.exists():
+        try:
+            db_services = set(get_existing_service_names(DB_VIEWER_COMPOSE))
+            db_viewer_can_update = DB_VIEWER_SERVICE in db_services
+        except SystemExit:
+            db_viewer_can_update = False
+
+    # 1) Determine an unused subnet for the new network
+    try:
+        existing_subnets = list_root_network_subnets(MAIN_COMPOSE)
+        chosen_subnet = pick_unused_subnet(existing_subnets)
+    except SystemExit as e:
+        raise click.ClickException(str(e))
+
+    # 2) Prompt for DB creds with sensible defaults (no confirmation for password)
+    default_user = app_name
+    default_db = app_name
+    gen_pw = pysecrets.token_urlsafe(40)
+
+    click.echo("\nDatabase credentials (press Enter to accept defaults):")
+    db_user = click.prompt("Database user", default=default_user)
+    db_password = click.prompt(
+        "Database password (auto-generated if left as default)",
+        default=gen_pw,
+        hide_input=True,
+        confirmation_prompt=False,
+        show_default=False,
+    )
+    db_database = click.prompt("Database name", default=default_db)
+
+    # 3) Prepare Postgres secrets names and file contents
+    img_lower = effective_image.lower()
+    if "postgres" not in img_lower:
+        click.secho("Warning: secrets scaffolding currently targets Postgres images. Proceeding anyway.", fg="yellow")
+
+    secret_user = f"{app_name}_postgresql_user"
+    secret_password = f"{app_name}_postgresql_password"
+    secret_db = f"{app_name}_postgresql_db"
+    secret_names = [secret_db, secret_user, secret_password]  # alphabetic insertion handled by util
+
+    secret_contents: Dict[str, str] = {
+        secret_user: db_user,
+        secret_password: db_password,
+        secret_db: db_database,
+    }
+
+    # 4) Previews
+    click.echo(f"\nMain compose: {MAIN_COMPOSE}")
+    click.echo("Network to add:")
+    net_preview = {
+        "networks": {
+            net_name: {
+                "name": net_name,
+                "internal": True,
+                "ipam": {"config": [{"subnet": chosen_subnet}]},
+            }
+        }
+    }
+    click.secho(dump_yaml_str(net_preview), fg="green")
+
+    internal_port = 5432 if "postgres" in img_lower else 3306
+    env: Dict[str, str] = {
+        "PUID": "$PUID",
+        "PGID": "$PGID",
+        "TZ": "$TZ",
+        "POSTGRES_USER_FILE": f"/run/secrets/{secret_user}",
+        "POSTGRES_PASSWORD_FILE": f"/run/secrets/{secret_password}",
+        "POSTGRES_DB_FILE": f"/run/secrets/{secret_db}",
+    }
+
+    svc = Service(
+        name=db_service_name,
+        image=effective_image,  # use the computed image
+        container_path=container_path,
+        profiles=[],  # 'all' added by validator
+        restart="unless-stopped",
+        expose=False,
+        internal_port=internal_port,
+        networks_extra=[net_name],
+        environment=env,
+        secrets=[secret_db, secret_user, secret_password],
+    )
+
+    svc_snippet = {svc.name: svc.to_compose_value()}
+    click.echo(f"\nThis DB service will be appended to {compose_path}:")
+    click.secho(dump_yaml_str(svc_snippet), fg="green")
+
+    # 5) Select additional services in the chosen compose to attach to this DB network
+    try:
+        existing_services = [s for s in get_existing_service_names(compose_path) if s != db_service_name]
+    except SystemExit as e:
+        raise click.ClickException(str(e))
+
+    attach_selected: List[str] = []
+    if existing_services:
+        click.echo(f"\nSelect additional services from {compose_path} to attach to '{net_name}':")
+        for i, it in enumerate(existing_services, start=1):
+            click.echo(f"  {i}. {it}")
+        raw = click.prompt("Enter numbers (comma-separated), or 0 to skip", default="0").strip()
+        if raw and raw != "0":
+            try:
+                idxs = [int(x) for x in raw.split(",") if x.strip()]
+                seen = set()
+                for i in idxs:
+                    if 1 <= i <= len(existing_services):
+                        name = existing_services[i - 1]
+                        if name not in seen:
+                            attach_selected.append(name)
+                            seen.add(name)
+            except ValueError:
+                click.secho("Invalid input; skipping additional attachments.", fg="yellow")
+
+    # 6) About to...
+    click.echo("\nAbout to:")
+    click.echo(f"- Add network '{net_name}' with subnet {chosen_subnet} to {MAIN_COMPOSE}")
+    click.echo(f"- Create secret files in {SECRETSDIR_PATH}: {', '.join([secret_user, secret_password, secret_db])}")
+    click.echo(f"- Add secrets entries to {MAIN_COMPOSE} (alphabetical) with comment '# {pretty_app} Secrets'")
+    click.echo(f"- Append DB service '{db_service_name}' to {compose_path}")
+    if attach_selected:
+        click.echo(f"- Attach network '{net_name}' to: {', '.join(attach_selected)}")
+    else:
+        click.echo("- No additional services selected for network attachment")
+    if db_viewer_can_update:
+        click.echo(f"- Attach network '{net_name}' to {DB_VIEWER_SERVICE} in {DB_VIEWER_COMPOSE}")
+    else:
+        click.echo(f"- Note: {DB_VIEWER_COMPOSE} missing or service '{DB_VIEWER_SERVICE}' not found; will skip updating it")
+
+    if not click.confirm("\nProceed?", default=True):
+        click.secho("No changes made.", fg="yellow")
+        return
+
+    # 7) Apply changes
+    try:
+        # Root network
+        upsert_network_in_main_compose(MAIN_COMPOSE, net_name, chosen_subnet, internal=True)
+
+        # Secrets: create files (sudo) then add to root compose
+        ensure_secret_files(SECRETSDIR_PATH, secret_contents)
+        upsert_root_secrets(MAIN_COMPOSE, pretty_app, [secret_db, secret_user, secret_password])
+
+        # Append DB service
+        upsert_service_in_file(compose_path, svc)
+
+        # Attach network to selected services in chosen compose
+        attach_network_to_services(compose_path, attach_selected, net_name)
+
+        # Also attach to pga in stacks/db-viewer.yml if available
+        if db_viewer_can_update:
+            attach_network_to_services(DB_VIEWER_COMPOSE, [DB_VIEWER_SERVICE], net_name)
+            click.secho(f"Attached '{net_name}' to {DB_VIEWER_SERVICE} in {DB_VIEWER_COMPOSE}", fg="green")
+
+    except SystemExit as e:
+        raise click.ClickException(str(e))
+
+    # 8) Done
+    click.secho(f"\nNetwork '{net_name}' added (or verified) in {MAIN_COMPOSE}", fg="green")
+    click.secho(f"Secrets created under {SECRETSDIR_PATH}", fg="green")
+    click.secho("Secrets entries added to root compose", fg="green")
+    click.secho(f"DB service '{db_service_name}' written to {compose_path}", fg="green")
+    if attach_selected:
+        click.secho(f"Attached '{net_name}' to: {', '.join(attach_selected)} in {compose_path}", fg="green")
+    else:
+        click.secho("No additional services were modified.", fg="yellow")
+
+@cli.command()
+@click.argument("name")
+def create_secret(name: str):
+    """
+    Create a secret file in $SECRETSDIR and register it under 'secrets:' in the root compose (alphabetically).
+    Usage: composify create_secret <file_name>
+    """
+    def _pretty_name(name: str) -> str:
+        return name.replace("-", " ").replace("_", " ").title()
+    secret_name = name.strip()
+    if not secret_name or any(ch in secret_name for ch in ("/", "\\")):
+        raise click.ClickException("Secret name must be a simple file name (no path separators).")
+
+    # Generate a strong secret value
+    value = pysecrets.token_urlsafe(40)
+
+    # 1) Create the secret file under $SECRETSDIR (no overwrite; requires sudo)
+    try:
+        ensure_secret_files(SECRETSDIR_PATH, {secret_name: value})
+    except SystemExit as e:
+        raise click.ClickException(str(e))
+
+    # 2) Register the secret in root compose (alphabetical), with a "# <Name> Secrets" comment header
+    display = _pretty_name(secret_name)
+    try:
+        upsert_root_secrets(MAIN_COMPOSE, display, [secret_name])
+    except SystemExit as e:
+        raise click.ClickException(str(e))
+
+    click.secho(f"Secret '{secret_name}' created at {SECRETSDIR_PATH}/{secret_name}", fg="green")
+    click.secho(f"Added '{secret_name}' to 'secrets:' in {MAIN_COMPOSE}", fg="green")
 
 if __name__ == "__main__":
     cli()
